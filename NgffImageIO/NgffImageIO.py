@@ -346,6 +346,89 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
 
+    def xarrayFromVolume(volumeNode) -> "xr.DataArray":
+        """Convert an volume node to an xarray.DataArray.
+        Origin and spacing metadata is preserved in the xarray's coords. The
+        Direction is set in the `direction` attribute.
+        Dims are labeled as `x`, `y`, `z`, `t`, and `c`.
+        This interface is and behavior is experimental and is subject to possible
+        future changes."""
+        import xarray as xr
+        import numpy as np
+        array_view = slicer.util.arrayFromVolume(volumeNode)
+        l_spacing = volumeNode.GetSpacing()
+        l_origin = volumeNode.GetOrigin()
+        l_size = volumeNode.GetImageData().GetDimensions()
+        image_dimension = 3
+        image_dims = ("x", "y", "z", "t")
+        coords = {}
+        for l_index, dim in enumerate(image_dims[:image_dimension]):
+            coords[dim] = np.linspace(
+                l_origin[l_index],
+                l_origin[l_index] + (l_size[l_index] - 1) * l_spacing[l_index],
+                l_size[l_index],
+                dtype=np.float64,
+            )
+        dims = list(reversed(image_dims[:image_dimension]))
+        components = volumeNode.GetImageData().GetNumberOfScalarComponents()
+        if components > 1:
+            dims.append("c")
+            coords["c"] = np.arange(components, dtype=np.uint32)
+        directionMatrixVtk = vtk.vtkMatrix4x4()
+        volumeNode.GetIJKToRASDirectionMatrix(directionMatrixVtk)
+        direction = np.flip(slicer.util.arrayFromVTKMatrix(directionMatrixVtk))
+        attrs = {"direction": direction}
+        for attributeName in volumeNode.GetAttributeNames():
+            attrs[key] = volumeNode.GetAttribute(attributeName)
+        data_array = xr.DataArray(array_view, dims=dims, coords=coords, attrs=attrs)
+        return data_array
+
+
+
+    def volumeFromXarray(data_array: "xr.DataArray"):
+        """Convert an xarray.DataArray to a MRML volume node.
+        """
+        import numpy as np
+        import builtins
+        if not {"t", "z", "y", "x", "c"}.issuperset(data_array.dims):
+            raise ValueError('Unsupported dims, supported dims: "t", "z", "y", "x", "c".')
+        image_dims = list({"t", "z", "y", "x"}.intersection(set(data_array.dims)))
+        image_dims.sort(reverse=True)
+        image_dimension = len(image_dims)
+        ordered_dims = ("t", "z", "y", "x")[-image_dimension:]
+        is_vector = "c" in data_array.dims
+        if is_vector:
+            ordered_dims = ordered_dims + ("c",)
+        values = data_array.values
+        if ordered_dims != data_array.dims:
+            dest = list(builtins.range(len(ordered_dims)))
+            source = dest.copy()
+            for ii in builtins.range(len(ordered_dims)):
+                source[ii] = data_array.dims.index(ordered_dims[ii])
+            values = np.moveaxis(values, source, dest).copy()
+        volumeNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScalarVolumeNode' if not is_vector else 'vtkMRMLVectorVolumeNode')
+        slicer.util.updateVolumeFromArray(volumeNode, values) # is_vector)
+        l_origin = [0.0] * image_dimension
+        l_spacing = [1.0] * image_dimension
+        for l_index, dim in enumerate(image_dims):
+            coords = data_array.coords[dim]
+            if coords.shape[0] > 1:
+                l_origin[l_index] = float(coords[0])
+                l_spacing[l_index] = float(coords[1]) - float(coords[0])
+        l_spacing.reverse()
+        volumeNode.SetSpacing(l_spacing)
+        l_origin.reverse()
+        volumeNode.SetOrigin(l_origin)
+        if "direction" in data_array.attrs:
+            direction = data_array.attrs["direction"]
+            directionMatrixVtk = slicer.util.vtkMatrixFromArray(np.flip(direction))
+            volumeNode.SetIJKToRASDirectionMatrix(directionMatrixVtk)
+        ignore_keys = set(["direction", "origin", "spacing"])
+        for key in data_array.attrs:
+            if not key in ignore_keys:
+                volumeNode.SetAttribute(key, data_array.attrs[key])
+        return volumeNode
+
 
 #
 # NgffImageIOTest
