@@ -40,6 +40,7 @@ add_subdirectory(StyleTester)
 add_subdirectory(UserStatistics)
 add_subdirectory(VolumeRenderingSpecialEffects)
 add_subdirectory(RemoveCtTable)
+add_subdirectory(NgffImageIO)
 
 #-----------------------------------------------------------------------------
 include(${Slicer_EXTENSION_GENERATE_CONFIG})
