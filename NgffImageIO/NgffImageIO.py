@@ -357,15 +357,16 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
         import numpy as np
         array_view = slicer.util.arrayFromVolume(volumeNode)
         l_spacing = volumeNode.GetSpacing()
-        l_origin = volumeNode.GetOrigin()
+        origin_ras = volumeNode.GetOrigin()
+        origin_lps = [-origin_ras[0], -origin_ras[1], origin_ras[2]]
         l_size = volumeNode.GetImageData().GetDimensions()
         image_dimension = 3
         image_dims = ("x", "y", "z", "t")
         coords = {}
         for l_index, dim in enumerate(image_dims[:image_dimension]):
             coords[dim] = np.linspace(
-                l_origin[l_index],
-                l_origin[l_index] + (l_size[l_index] - 1) * l_spacing[l_index],
+                origin_lps[l_index],
+                origin_lps[l_index] + (l_size[l_index] - 1) * l_spacing[l_index],
                 l_size[l_index],
                 dtype=np.float64,
             )
@@ -374,16 +375,16 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
         if components > 1:
             dims.append("c")
             coords["c"] = np.arange(components, dtype=np.uint32)
-        directionMatrixVtk = vtk.vtkMatrix4x4()
-        volumeNode.GetIJKToRASDirectionMatrix(directionMatrixVtk)
-        direction = np.flip(slicer.util.arrayFromVTKMatrix(directionMatrixVtk))
+        ijkToRasMatrixVtk = vtk.vtkMatrix4x4()
+        volumeNode.GetIJKToRASDirectionMatrix(ijkToRasMatrixVtk)
+        ijkToRasMatrix = slicer.util.arrayFromVTKMatrix(ijkToRasMatrixVtk)
+        ijkToLpsMatrix = np.dot(ijkToRasMatrix, np.diag([-1.0, -1.0, 1.0, 1.0]))
+        direction = np.flip(ijkToLpsMatrix)
         attrs = {"direction": direction}
         for attributeName in volumeNode.GetAttributeNames():
             attrs[key] = volumeNode.GetAttribute(attributeName)
         data_array = xr.DataArray(array_view, dims=dims, coords=coords, attrs=attrs)
         return data_array
-
-
 
     def volumeFromXarray(data_array: "xr.DataArray"):
         """Convert an xarray.DataArray to a MRML volume node.
@@ -408,21 +409,23 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
             values = np.moveaxis(values, source, dest).copy()
         volumeNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScalarVolumeNode' if not is_vector else 'vtkMRMLVectorVolumeNode')
         slicer.util.updateVolumeFromArray(volumeNode, values) # is_vector)
-        l_origin = [0.0] * image_dimension
+        origin_lps = [0.0] * image_dimension
         l_spacing = [1.0] * image_dimension
         for l_index, dim in enumerate(image_dims):
             coords = data_array.coords[dim]
             if coords.shape[0] > 1:
-                l_origin[l_index] = float(coords[0])
+                origin_lps[l_index] = float(coords[0])
                 l_spacing[l_index] = float(coords[1]) - float(coords[0])
         l_spacing.reverse()
         volumeNode.SetSpacing(l_spacing)
-        l_origin.reverse()
-        volumeNode.SetOrigin(l_origin)
+        origin_lps.reverse()
+        origin_ras = [-origin_lps[0], -origin_lps[1], origin_lps[2]]
+        volumeNode.SetOrigin(origin_ras)
         if "direction" in data_array.attrs:
             direction = data_array.attrs["direction"]
-            directionMatrixVtk = slicer.util.vtkMatrixFromArray(np.flip(direction))
-            volumeNode.SetIJKToRASDirectionMatrix(directionMatrixVtk)
+            ijkToLps = np.flip(direction)
+            ijkToRas = np.dot(ijkToLps, np.diag([-1.0, -1.0, 1.0, 1.0]))
+            volumeNode.SetIJKToRASDirectionMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
         ignore_keys = set(["direction", "origin", "spacing"])
         for key in data_array.attrs:
             if not key in ignore_keys:
