@@ -347,27 +347,34 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
 
     def xarrayFromVolume(volumeNode) -> "xr.DataArray":
-        """Convert an volume node to an xarray.DataArray.
-        Origin and spacing metadata is preserved in the xarray's coords. The
-        Direction is set in the `direction` attribute.
+        """Convert a volume node to an xarray.DataArray.
+        Since image axes may be rotated in physical space but xarray accessors do not
+        support rotated axes, the image in the xarray is defined in the "xyz" space,
+        which is voxel space scaled with the image spacing.
+        `xyzToPhysicalTransform` attribute stores a 4x4 homogeneous transformation matrix
+        to transform between xyz to physical (LPS) coordinate systems.
+        Spacing metadata is preserved in the xarray's coords.
         Dims are labeled as `x`, `y`, `z`, `t`, and `c`.
         This interface is and behavior is experimental and is subject to possible
         future changes."""
         import xarray as xr
         import numpy as np
         array_view = slicer.util.arrayFromVolume(volumeNode)
-        l_spacing = volumeNode.GetSpacing()
+        spacing = volumeNode.GetSpacing()
         origin_ras = volumeNode.GetOrigin()
         origin_lps = [-origin_ras[0], -origin_ras[1], origin_ras[2]]
-        l_size = volumeNode.GetImageData().GetDimensions()
+        size = volumeNode.GetImageData().GetDimensions()
         image_dimension = 3
         image_dims = ("x", "y", "z", "t")
         coords = {}
-        for l_index, dim in enumerate(image_dims[:image_dimension]):
+        # When we export an image, xyz origin is always set to (0,0,0), but after processing
+        # (such as resampling or extracting a subset of the data), the origin may change.
+        origin_xyz = [0.0, 0.0, 0.0]
+        for index, dim in enumerate(image_dims[:image_dimension]):
             coords[dim] = np.linspace(
-                origin_lps[l_index],
-                origin_lps[l_index] + (l_size[l_index] - 1) * l_spacing[l_index],
-                l_size[l_index],
+                origin_xyz[index],
+                origin_xyz[index] + (size[index] - 1) * spacing[index],
+                size[index],
                 dtype=np.float64,
             )
         dims = list(reversed(image_dims[:image_dimension]))
@@ -376,11 +383,13 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
             dims.append("c")
             coords["c"] = np.arange(components, dtype=np.uint32)
         ijkToRasMatrixVtk = vtk.vtkMatrix4x4()
-        volumeNode.GetIJKToRASDirectionMatrix(ijkToRasMatrixVtk)
+        volumeNode.GetIJKToRASMatrix(ijkToRasMatrixVtk)
         ijkToRasMatrix = slicer.util.arrayFromVTKMatrix(ijkToRasMatrixVtk)
         ijkToLpsMatrix = np.dot(ijkToRasMatrix, np.diag([-1.0, -1.0, 1.0, 1.0]))
-        direction = np.flip(ijkToLpsMatrix)
-        attrs = {"direction": direction}
+        xyzToIjkMatrix = np.diag([1.0/spacing[0], 1.0/spacing[1], 1.0/spacing[2], 1.0])
+        xyzToLpsMatrix = np.dot(ijkToLpsMatrix, xyzToIjkMatrix)
+        print(f"xyzToPhysical={xyzToLpsMatrix}")
+        attrs = {"xyzToPhysicalTransform": np.flip(xyzToLpsMatrix)}
         for attributeName in volumeNode.GetAttributeNames():
             attrs[key] = volumeNode.GetAttribute(attributeName)
         data_array = xr.DataArray(array_view, dims=dims, coords=coords, attrs=attrs)
@@ -409,28 +418,35 @@ class NgffImageIOLogic(ScriptedLoadableModuleLogic):
             values = np.moveaxis(values, source, dest).copy()
         volumeNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScalarVolumeNode' if not is_vector else 'vtkMRMLVectorVolumeNode')
         slicer.util.updateVolumeFromArray(volumeNode, values) # is_vector)
-        origin_lps = [0.0] * image_dimension
-        l_spacing = [1.0] * image_dimension
-        for l_index, dim in enumerate(image_dims):
+        origin_xyz = [0.0] * image_dimension
+        spacing = [1.0] * image_dimension
+        for index, dim in enumerate(image_dims):
             coords = data_array.coords[dim]
             if coords.shape[0] > 1:
-                origin_lps[l_index] = float(coords[0])
-                l_spacing[l_index] = float(coords[1]) - float(coords[0])
-        l_spacing.reverse()
-        volumeNode.SetSpacing(l_spacing)
-        origin_lps.reverse()
-        origin_ras = [-origin_lps[0], -origin_lps[1], origin_lps[2]]
-        volumeNode.SetOrigin(origin_ras)
-        if "direction" in data_array.attrs:
-            direction = data_array.attrs["direction"]
-            ijkToLps = np.flip(direction)
-            ijkToRas = np.dot(ijkToLps, np.diag([-1.0, -1.0, 1.0, 1.0]))
-            volumeNode.SetIJKToRASDirectionMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
-        ignore_keys = set(["direction", "origin", "spacing"])
+                origin_xyz[index] = float(coords[0])
+                print(f'origin[{dim}] = {origin_xyz[index]}')
+                spacing[index] = float(coords[-1] - coords[0]) / float(len(coords)-1)
+                print(f'coords[{dim}] spacing = ({coords[-1]} - {coords[0]}) / {len(coords)-1} = {spacing[index]}')
+        spacing.reverse()
+        origin_xyz.reverse()
+        ijkToXyz = np.diag([spacing[0], spacing[1], spacing[2], 1.0])
+        ijkToXyz[:,3] = [-origin_xyz[0], -origin_xyz[1], origin_xyz[2], 1.0]  # TODO: it is not clear why first two components need sign inversion
+        print(f"ijkToXyz={ijkToXyz}")
+        if "xyzToPhysicalTransform" in data_array.attrs:
+            xyzToPhysical = np.flip(data_array.attrs["xyzToPhysicalTransform"])
+        else:
+            xyzToPhysical = np.identity(4)
+        ijkToLps = np.dot(xyzToPhysical, ijkToXyz)
+        ijkToRas = np.dot(ijkToLps, np.diag([-1.0, -1.0, 1.0, 1.0]))
+        print(f"xyzToPhysical={xyzToPhysical}")
+        print(f"ijkToRas={ijkToRas}")
+        volumeNode.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
+        ignore_keys = set(["xyzToPhysicalTransform"])
         for key in data_array.attrs:
             if not key in ignore_keys:
                 volumeNode.SetAttribute(key, data_array.attrs[key])
         return volumeNode
+
 
 
 #
@@ -500,3 +516,36 @@ class NgffImageIOTest(ScriptedLoadableModuleTest):
         self.assertEqual(outputScalarRange[1], inputScalarRange[1])
 
         self.delayDisplay('Test passed')
+
+        # Convert to xarray
+        import SampleData
+        sampleDataLogic = SampleData.SampleDataLogic()
+        #volumeNode = sampleDataLogic.downloadMRBrainTumor1() 
+        volumeNode = sampleDataLogic.downloadMRHead()
+        da = xarrayFromVolume(volumeNode)
+        print(da)
+
+        # Save as zarr
+        ds = da.to_dataset(name='image').chunk({'x': 20, 'y': -1})
+        zs = ds.to_zarr('c:/tmp/zarrimage/', mode='w')
+
+        # Load from zarr
+        import xarray as xr
+        ds=xr.open_dataset(r'c:\tmp\zarrimage', engine='zarr')
+
+        # Convert to volume
+        volumeNode = volumeFromXarray(da)
+
+        # Display volume
+        setSliceViewerLayers(volumeNode)
+
+        # Load region of a volume
+        ds=xr.open_dataset(r'c:\tmp\zarrimage', engine='zarr', chunks={})
+
+        import numpy as np
+        dsPart = ds.sel(x=np.arange(50, 180, 2), y=np.arange(40, 160, 2), z=np.arange(50, 60, 2), method='nearest').image
+        volumePart = volumeFromXarray(dsPart)
+        volumePart.CreateDefaultDisplayNodes()
+        volumePart.GetScalarVolumeDisplayNode().SetAndObserveColorNodeID('vtkMRMLColorTableNodeRed')
+        setSliceViewerLayers(foreground=volumePart, foregroundOpacity=0.5)
+
